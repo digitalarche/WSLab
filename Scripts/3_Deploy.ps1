@@ -1,8 +1,14 @@
 ﻿# Verify Running as Admin
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
-If (!( $isAdmin )) {
+If (-not $isAdmin) {
     Write-Host "-- Restarting as Administrator" -ForegroundColor Cyan ; Start-Sleep -Seconds 1
-    Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs 
+
+    if($PSVersionTable.PSEdition -eq "Core") {
+        Start-Process pwsh.exe "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs 
+    } else {
+        Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs 
+    }
+
     exit
 }
 
@@ -270,7 +276,7 @@ If (!( $isAdmin )) {
     }
 
     function  Get-WindowsBuildNumber { 
-        $os = Get-WmiObject -Class Win32_OperatingSystem 
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem
         return [int]($os.BuildNumber) 
     } 
 
@@ -315,45 +321,44 @@ If (!( $isAdmin )) {
             [Switch]$Dhcp
         )
 
-        $VM = Get-WmiObject -Namespace 'root\virtualization\v2' -Class 'Msvm_ComputerSystem' | Where-Object { $_.ElementName -eq $NetworkAdapter.VMName } 
-        $VMSettings = $vm.GetRelated('Msvm_VirtualSystemSettingData') | Where-Object { $_.VirtualSystemType -eq 'Microsoft:Hyper-V:System:Realized' }    
-        $VMNetAdapters = $VMSettings.GetRelated('Msvm_SyntheticEthernetPortSettingData') 
+        $VM = Get-CimInstance -Namespace "root\virtualization\v2" -ClassName "Msvm_ComputerSystem" | Where-Object ElementName -eq $NetworkAdapter.VMName 
+        $VMSettings = Get-CimAssociatedInstance -InputObject $vm -ResultClassName "Msvm_VirtualSystemSettingData" | Where-Object VirtualSystemType -EQ "Microsoft:Hyper-V:System:Realized"
+        $VMNetAdapters = Get-CimAssociatedInstance -InputObject $VMSettings -ResultClassName "Msvm_SyntheticEthernetPortSettingData"
 
-        $NetworkSettings = @()
-        foreach ($NetAdapter in $VMNetAdapters) {
-            if ($NetAdapter.elementname -eq $NetworkAdapter.name) {
-                $NetworkSettings = $NetworkSettings + $NetAdapter.GetRelated("Msvm_GuestNetworkAdapterConfiguration")
+        $networkAdapterConfiguration = @()
+        foreach ($netAdapter in $VMNetAdapters) {
+            if ($netAdapter.ElementName -eq $NetworkAdapter.Name) {
+                $networkAdapterConfiguration = Get-CimAssociatedInstance -InputObject $netAdapter -ResultClassName "Msvm_GuestNetworkAdapterConfiguration"
+                break
             }
         }
 
-        $NetworkSettings[0].IPAddresses = $IPAddress
-        $NetworkSettings[0].Subnets = $Subnet
-        $NetworkSettings[0].DefaultGateways = $DefaultGateway
-        $NetworkSettings[0].DNSServers = $DNSServer
-        $NetworkSettings[0].ProtocolIFType = 4096
+        $networkAdapterConfiguration.PSBase.CimInstanceProperties["IPAddresses"].Value = $IPAddress
+        $networkAdapterConfiguration.PSBase.CimInstanceProperties["Subnets"].Value = $Subnet
+        $networkAdapterConfiguration.PSBase.CimInstanceProperties["DefaultGateways"].Value = $DefaultGateway
+        $networkAdapterConfiguration.PSBase.CimInstanceProperties["DNSServers"].Value = $DNSServer
+        $networkAdapterConfiguration.PSBase.CimInstanceProperties["ProtocolIFType"].Value = 4096
 
         if ($dhcp) {
-            $NetworkSettings[0].DHCPEnabled = $true
+            $networkAdapterConfiguration.PSBase.CimInstanceProperties["DHCPEnabled"].Value = $true
         } else {
-            $NetworkSettings[0].DHCPEnabled = $false
+            $networkAdapterConfiguration.PSBase.CimInstanceProperties["DHCPEnabled"].Value = $false
         }
 
-        $Service = Get-WmiObject -Class "Msvm_VirtualSystemManagementService" -Namespace "root\virtualization\v2"
-        $setIP = $Service.SetGuestNetworkAdapterConfiguration($VM, $NetworkSettings[0].GetText(1))
+        $cimSerializer = [Microsoft.Management.Infrastructure.Serialization.CimSerializer]::Create()
+        $serializedInstance = $cimSerializer.Serialize($networkAdapterConfiguration, [Microsoft.Management.Infrastructure.Serialization.InstanceSerializationOptions]::None)
+        $serializedInstanceString = [System.Text.Encoding]::Unicode.GetString($serializedInstance)
 
-        if ($setip.ReturnValue -eq 4096) {
-            $job=[WMI]$setip.job 
-            while ($job.JobState -eq 3 -or $job.JobState -eq 4) {
-                start-sleep 1
-                $job=[WMI]$setip.job
-            }
-            if ($job.JobState -eq 7) {
-                WriteInfoHighlighted "`t Success"
-            }else {
-            $job.GetError()
-            }
-        }elseif($setip.ReturnValue -eq 0) {
+        $service = Get-CimInstance -ClassName "Msvm_VirtualSystemManagementService" -Namespace "root\virtualization\v2"
+        $setIp = Invoke-CimMethod -InputObject $service -MethodName "SetGuestNetworkAdapterConfiguration" -Arguments @{
+            ComputerSystem = $VM
+            NetworkConfiguration = @($serializedInstanceString)
+        }
+        if($setIp.ReturnValue -eq 0) { # completed
             WriteInfoHighlighted "`t Success"
+        } else {
+            # unexpected response
+            $setIp
         }
     }
 
@@ -682,6 +687,14 @@ If (!( $isAdmin )) {
 
     $global:IP=1
 
+    if (-not ($LabConfig.Prefix)){
+        $labconfig.prefix="$($PSScriptRoot | Split-Path -Leaf)-"
+    }
+
+    if (-not ($LabConfig.SwitchName)){
+        $LabConfig.SwitchName = 'LabSwitch'
+    }
+
     WriteInfoHighlighted "List of variables used"
     WriteInfo "`t Prefix used in lab is $($labconfig.prefix)"
 
@@ -701,16 +714,11 @@ If (!( $isAdmin )) {
     $TimeZone=(Get-TimeZone).id
 
     #Grab number of processors
-    (get-wmiobject win32_processor).NumberOfLogicalProcessors  | ForEach-Object { $global:NumberOfLogicalProcessors += $_}
+    Get-CimInstance -ClassName "win32_processor" | Select-Object NumberOfLogicalProcessors | ForEach-Object { $global:NumberOfLogicalProcessors += $_ }
 
 #endregion
 
 #region Some Additional checks and prereqs configuration
-
-    #checking if Prefix is not empty
-        if (!$LabConfig.Prefix){
-            WriteErrorAndExit "`t Prefix is empty. Exiting"
-        }
 
     # Checking for Compatible OS
         WriteInfoHighlighted "Checking if OS is Windows 10 1511 (10586)/Server 2016 or newer"
@@ -759,7 +767,7 @@ If (!( $isAdmin )) {
             WriteInfoHighlighted "Configuration contains Shared or Replica scenario"
 
             WriteInfo "Checking support for shared disks"
-            $OS=Get-WmiObject win32_operatingsystem
+            $OS = Get-CimInstance -ClassName "win32_operatingsystem"
             if (($OS.caption -like "*Server*") -and $OS.version -gt 10){
                 WriteInfo "`t Installing Failover Clustering Feature"
                 $FC=Install-WindowsFeature Failover-Clustering
@@ -801,6 +809,15 @@ If (!( $isAdmin )) {
             WriteSuccess "`t Hyper-V is Installed"
         }else{
             WriteErrorAndExit "`t Hyper-V tools are not installed. Please install Hyper-V management tools. Exiting"
+        }
+
+    #Check if at least 2GB (+200Mb just to be sure) memory is available
+        WriteInfoHighlighted "Checking if at least 2GB RAM is available"
+        $MemoryAvailableMB=(Get-Ciminstance Win32_OperatingSystem).FreePhysicalMemory/1KB
+        if ($MemoryAvailableMB -gt (2048+200)){
+            WriteSuccess "`t $("{0:n0}" -f $MemoryAvailableMB) MB RAM Available"
+        }else{
+            WriteErrorAndExit "`t Please make sure you have at least 2 GB available memory. Exiting"
         }
 
     #enable EnableEnhancedSessionMode if not enabled

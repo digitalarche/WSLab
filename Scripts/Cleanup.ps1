@@ -1,8 +1,14 @@
 ﻿# Verify Running as Admin
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
-If (!( $isAdmin )) {
+If (-not $isAdmin) {
     Write-Host "-- Restarting as Administrator" -ForegroundColor Cyan ; Start-Sleep -Seconds 1
-    Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs 
+
+    if($PSVersionTable.PSEdition -eq "Core") {
+        Start-Process pwsh.exe "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs 
+    } else {
+        Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs 
+    }
+
     exit
 }
 
@@ -36,18 +42,16 @@ If (!( $isAdmin )) {
 
     #load LabConfig
         . "$PSScriptRoot\LabConfig.ps1"
-        $prefix=$LabConfig.Prefix
 
-    #just to be sure, not clean all VMs
-        if (!$prefix){
-            WriteErrorAndExit "Prefix is empty. Exiting"
+        if (-not ($LabConfig.Prefix)){
+            $labconfig.Prefix="$($PSScriptRoot | Split-Path -Leaf)-"
         }
 
     #grab all VMs, switches and DC
-        $VMs=get-vm -Name $prefix* | where Name -ne "$($prefix)DC" -ErrorAction SilentlyContinue | Sort-Object -Property Name
+        $VMs=get-vm -Name "$($LabConfig.Prefix)*" | Where-Object Name -ne "$($LabConfig.Prefix)DC" -ErrorAction SilentlyContinue | Sort-Object -Property Name
         $vSwitch=Get-VMSwitch "$($labconfig.prefix)$($LabConfig.SwitchName)" -ErrorAction SilentlyContinue
         $extvSwitch=Get-VMSwitch "$($labconfig.prefix)$($LabConfig.SwitchName)-External" -ErrorAction SilentlyContinue
-        $DC=get-vm "$($prefix)DC" -ErrorAction SilentlyContinue
+        $DC=get-vm "$($LabConfig.Prefix)DC" -ErrorAction SilentlyContinue
 
     #List VMs, Switches and DC
         If ($VMs){
@@ -138,6 +142,6 @@ If (!( $isAdmin )) {
             WriteErrorAndExit "You did not type Y"
         }
     }else{
-        WriteErrorAndExit "No VMs and Switches with prefix $prefix detected. Exitting"
+        WriteErrorAndExit "No VMs and Switches with prefix $($LabConfig.Prefix) detected. Exitting"
     }
 #endregion
